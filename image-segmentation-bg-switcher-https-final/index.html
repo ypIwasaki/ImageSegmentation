@@ -44,8 +44,8 @@
             <label style="margin-top: 4px;">
               AIモデル選択
               <select id="modelSelect">
-                <option value="modnet" selected>MODNet (matting / 高品質)</option>
-                <option value="mediapipe-general">MediaPipe General (高精度)</option>
+                <option value="modnet">MODNet (matting / 高品質)</option>
+                <option value="mediapipe-general" selected>MediaPipe General (高精度)</option>
                 <option value="mediapipe-landscape">MediaPipe Landscape (軽量 / 高速)</option>
               </select>
             </label>
@@ -57,6 +57,36 @@
                 <option value="hard">Hard (従来 / 2値化)</option>
               </select>
             </label>
+
+            <div class="slider-container">
+              <div class="slider-header">
+                <label for="maskAlphaLowInput">マスク下限</label>
+                <span class="slider-value" id="maskAlphaLowValue">0.35</span>
+              </div>
+              <input
+                id="maskAlphaLowInput"
+                type="range"
+                min="0"
+                max="0.8"
+                step="0.01"
+                value="0.35"
+              />
+            </div>
+
+            <div class="slider-container">
+              <div class="slider-header">
+                <label for="maskAlphaHighInput">マスク上限</label>
+                <span class="slider-value" id="maskAlphaHighValue">0.75</span>
+              </div>
+              <input
+                id="maskAlphaHighInput"
+                type="range"
+                min="0.2"
+                max="1"
+                step="0.01"
+                value="0.75"
+              />
+            </div>
 
             <div class="slider-container">
               <div class="slider-header">

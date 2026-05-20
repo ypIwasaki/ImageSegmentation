@@ -14,6 +14,10 @@ const imageInput = document.querySelector('#imageInput');
 const mirrorInput = document.querySelector('#mirrorInput');
 const modelSelect = document.querySelector('#modelSelect');
 const maskStyleSelect = document.querySelector('#maskStyleSelect');
+const maskAlphaLowInput = document.querySelector('#maskAlphaLowInput');
+const maskAlphaLowValue = document.querySelector('#maskAlphaLowValue');
+const maskAlphaHighInput = document.querySelector('#maskAlphaHighInput');
+const maskAlphaHighValue = document.querySelector('#maskAlphaHighValue');
 const maskFeatherInput = document.querySelector('#maskFeatherInput');
 const maskFeatherValue = document.querySelector('#maskFeatherValue');
 const temporalSmoothingInput = document.querySelector('#temporalSmoothingInput');
@@ -33,8 +37,6 @@ let frameTimestamp = 0; // MediaPipe用の厳密な単調増加タイムスタ�
 const MEDIAPIPE_SEGMENT_INTERVAL_MS = 33;
 const MODNET_SEGMENT_INTERVAL_MS = 50;
 const HARD_MASK_THRESHOLD = 0.5;
-const MASK_ALPHA_LOW = 0.35;
-const MASK_ALPHA_HIGH = 0.75;
 const DEFAULT_BACKGROUND_NAME = 'AdobeStock_310895879.jpeg';
 const ORT_CDN_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.21.1/';
 const MODNET_MODEL_URL = 'https://huggingface.co/gradio/Modnet/resolve/main/modnet.onnx';
@@ -327,9 +329,27 @@ function confidenceToAlpha(confidence) {
   if (maskStyleSelect.value === 'hard') {
     return confidence >= HARD_MASK_THRESHOLD ? 255 : 0;
   }
-  const t = Math.max(0, Math.min(1, (confidence - MASK_ALPHA_LOW) / (MASK_ALPHA_HIGH - MASK_ALPHA_LOW)));
+  const low = getMaskAlphaLow();
+  const high = getMaskAlphaHigh();
+  const t = Math.max(0, Math.min(1, (confidence - low) / Math.max(high - low, 0.0001)));
   const smooth = t * t * (3 - 2 * t);
   return Math.round(smooth * 255);
+}
+
+function getMaskAlphaLow() {
+  return Number(maskAlphaLowInput.value);
+}
+
+function getMaskAlphaHigh() {
+  return Math.max(Number(maskAlphaHighInput.value), getMaskAlphaLow() + 0.01);
+}
+
+function updateMaskAlphaValues() {
+  maskAlphaLowValue.textContent = getMaskAlphaLow().toFixed(2);
+  if (Number(maskAlphaHighInput.value) < getMaskAlphaHigh()) {
+    maskAlphaHighInput.value = getMaskAlphaHigh().toFixed(2);
+  }
+  maskAlphaHighValue.textContent = getMaskAlphaHigh().toFixed(2);
 }
 
 function getMaskFeatherPx() {
@@ -649,7 +669,11 @@ function updateVisibility() {
 function updateModelControlState() {
   const usingModnet = isModnetSelected();
   maskStyleSelect.disabled = usingModnet;
+  maskAlphaLowInput.disabled = usingModnet;
+  maskAlphaHighInput.disabled = usingModnet;
   maskStyleSelect.title = usingModnet ? 'MODNet はアルファマットを直接出力するため、この設定は使いません。' : '';
+  maskAlphaLowInput.title = usingModnet ? 'MODNet はアルファマットを直接出力するため、この設定は使いません。' : '';
+  maskAlphaHighInput.title = usingModnet ? 'MODNet はアルファマットを直接出力するため、この設定は使いません。' : '';
 }
 
 modeSelect.addEventListener('change', updateVisibility);
@@ -657,6 +681,7 @@ modeSelect.addEventListener('change', updateVisibility);
 // Run once initially to hide non-active controls
 updateVisibility();
 updateModelControlState();
+updateMaskAlphaValues();
 updateMaskFeatherValue();
 updateTemporalSmoothingValue();
 loadBackgroundImage(defaultBackgroundUrl, DEFAULT_BACKGROUND_NAME);
@@ -691,6 +716,18 @@ modelSelect.addEventListener('change', async () => {
 maskStyleSelect.addEventListener('change', () => {
   resetTemporalSmoothing();
   log('Mask style changed', { style: maskStyleSelect.value });
+});
+
+maskAlphaLowInput.addEventListener('input', () => {
+  updateMaskAlphaValues();
+  resetTemporalSmoothing();
+  log('Mask alpha low changed', { value: getMaskAlphaLow() });
+});
+
+maskAlphaHighInput.addEventListener('input', () => {
+  updateMaskAlphaValues();
+  resetTemporalSmoothing();
+  log('Mask alpha high changed', { value: getMaskAlphaHigh() });
 });
 
 maskFeatherInput.addEventListener('input', () => {
