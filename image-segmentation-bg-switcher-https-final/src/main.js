@@ -1,5 +1,6 @@
 import './styles.css';
 import { ImageSegmenter, FilesetResolver } from '@mediapipe/tasks-vision';
+import defaultBackgroundUrl from '../../images/AdobeStock_310895879.jpeg';
 
 const video = document.querySelector('#cameraVideo');
 const canvas = document.querySelector('#outputCanvas');
@@ -33,6 +34,7 @@ const SEGMENT_INTERVAL_MS = 33;
 const HARD_MASK_THRESHOLD = 0.5;
 const MASK_ALPHA_LOW = 0.35;
 const MASK_ALPHA_HIGH = 0.75;
+const DEFAULT_BACKGROUND_NAME = 'AdobeStock_310895879.jpeg';
 
 // 高速レンダリング用のオフスクリーンキャンバス キャッシュ（マスク用 & 人物切り抜き用）
 let maskImageData = null;
@@ -252,6 +254,26 @@ function resetTemporalSmoothing() {
   temporalAlphaReady = false;
 }
 
+function applyBackgroundImage(img, sourceLabel) {
+  backgroundImage = img;
+  modeSelect.value = 'image';
+  updateVisibility();
+  log('Background image loaded', {
+    source: sourceLabel,
+    width: img.naturalWidth,
+    height: img.naturalHeight,
+  });
+}
+
+function loadBackgroundImage(url, sourceLabel) {
+  const img = new Image();
+  img.onload = () => applyBackgroundImage(img, sourceLabel);
+  img.onerror = () => {
+    log('Background image load failed', { source: sourceLabel, url });
+  };
+  img.src = url;
+}
+
 // Float32の信頼度マスクから、連続的なアルファを持つソフトマスクを生成
 function getMaskCanvas(mask) {
   const w = mask.width;
@@ -452,6 +474,7 @@ modeSelect.addEventListener('change', updateVisibility);
 updateVisibility();
 updateMaskFeatherValue();
 updateTemporalSmoothingValue();
+loadBackgroundImage(defaultBackgroundUrl, DEFAULT_BACKGROUND_NAME);
 
 imageInput.addEventListener('change', () => {
   const file = imageInput.files?.[0];
@@ -464,17 +487,7 @@ imageInput.addEventListener('change', () => {
 
   // 新しいオブジェクトURLを生成（onload完了まで解放しない）
   currentBgUrl = URL.createObjectURL(file);
-  const img = new Image();
-  img.onload = () => {
-    backgroundImage = img;
-    modeSelect.value = 'image';
-    updateVisibility(); // Refresh visibility!
-    log('Background image loaded', { width: img.naturalWidth, height: img.naturalHeight });
-  };
-  img.onerror = () => {
-    log('Background image load failed');
-  };
-  img.src = currentBgUrl;
+  loadBackgroundImage(currentBgUrl, file.name);
 });
 
 modelSelect.addEventListener('change', async () => {
