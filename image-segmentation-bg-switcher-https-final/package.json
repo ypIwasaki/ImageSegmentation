@@ -1,0 +1,17 @@
+{
+  "name": "image-segmentation-bg-switcher-https-final",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "dev:https": "node scripts/ensure-cert.mjs && LOCAL_HTTPS=true vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview:https": "node scripts/ensure-cert.mjs && LOCAL_HTTPS=true vite preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.35",
+    "@vitejs/plugin-basic-ssl": "latest",
+    "vite": "latest"
+  }
+}

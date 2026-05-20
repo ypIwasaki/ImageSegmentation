@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Realtime Background Switcher</title>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>⚡ Realtime Background Switcher</h1>
+        <p>MediaPipe Selfie Segmentation + 2D Canvas compositing pipeline</p>
+      </header>
+
+      <main class="layout">
+        <section class="stage-wrap">
+          <canvas id="outputCanvas" width="1280" height="720"></canvas>
+          <video id="cameraVideo" playsinline muted autoplay></video>
+        </section>
+
+        <aside class="panel">
+          <!-- 1. カメラ制御 -->
+          <div class="panel-section">
+            <span class="section-title">カメラ接続</span>
+            <div class="control-row">
+              <button id="startButton">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                カメラ開始
+              </button>
+              <button id="stopButton" disabled>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h12V5H6v14z"/></svg>
+                停止
+              </button>
+            </div>
+            
+            <label class="checkbox-label">
+              <span>左右反転（ミラー）</span>
+              <div class="checkbox-container">
+                <input id="mirrorInput" type="checkbox" checked />
+                <span class="toggle-slider"></span>
+              </div>
+            </label>
+
+            <label style="margin-top: 4px;">
+              AIモデル選択
+              <select id="modelSelect">
+                <option value="1" selected>General (高精度)</option>
+                <option value="0">Landscape (軽量 / 高速)</option>
+              </select>
+            </label>
+          </div>
+
+          <!-- 2. 背景合成モード -->
+          <div class="panel-section">
+            <span class="section-title">背景エフェクト設定</span>
+            <label>
+              表示モード
+              <select id="modeSelect">
+                <option value="raw">カメラ映像そのまま</option>
+                <option value="color">背景単色</option>
+                <option value="image">背景画像差し替え</option>
+              </select>
+            </label>
+
+            <div class="color-picker-container" id="colorPickerContainer" style="display: none;">
+              <input id="colorInput" type="color" value="#1f6feb" />
+              <label for="colorInput">背景カラー</label>
+            </div>
+
+            <label id="imageInputContainer" style="display: none;">
+              背景画像アップロード
+              <input id="imageInput" type="file" accept="image/*" />
+            </label>
+          </div>
+
+          <!-- 4. システム状態 -->
+          <div class="panel-section status-container">
+            <span class="section-title">システム状態</span>
+            <div class="status" id="status">待機中</div>
+            
+            <details>
+              <summary>診断ログ (デバッグ)</summary>
+              <pre id="debugLog"></pre>
+            </details>
+          </div>
+        </aside>
+      </main>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
