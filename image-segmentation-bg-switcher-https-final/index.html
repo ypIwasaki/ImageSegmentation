@@ -48,6 +48,29 @@
                 <option value="0">Landscape (軽量 / 高速)</option>
               </select>
             </label>
+
+            <label>
+              切り抜きマスク
+              <select id="maskStyleSelect">
+                <option value="soft" selected>Soft (改善版 / 滑らか)</option>
+                <option value="hard">Hard (従来 / 2値化)</option>
+              </select>
+            </label>
+
+            <div class="slider-container">
+              <div class="slider-header">
+                <label for="maskFeatherInput">境界フェザー</label>
+                <span class="slider-value" id="maskFeatherValue">1.5px</span>
+              </div>
+              <input
+                id="maskFeatherInput"
+                type="range"
+                min="0"
+                max="3"
+                step="0.5"
+                value="1.5"
+              />
+            </div>
           </div>
 
           <!-- 2. 背景合成モード -->

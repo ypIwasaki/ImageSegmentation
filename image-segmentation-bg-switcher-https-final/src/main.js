@@ -12,6 +12,9 @@ const colorInput = document.querySelector('#colorInput');
 const imageInput = document.querySelector('#imageInput');
 const mirrorInput = document.querySelector('#mirrorInput');
 const modelSelect = document.querySelector('#modelSelect');
+const maskStyleSelect = document.querySelector('#maskStyleSelect');
+const maskFeatherInput = document.querySelector('#maskFeatherInput');
+const maskFeatherValue = document.querySelector('#maskFeatherValue');
 const statusEl = document.querySelector('#status');
 const debugEl = document.querySelector('#debugLog');
 
@@ -25,6 +28,9 @@ let segmentBusy = false;
 let lastSegmentAt = 0;
 let frameTimestamp = 0; // MediaPipe用の厳密な単調増加タイムスタンプカウンター
 const SEGMENT_INTERVAL_MS = 33;
+const HARD_MASK_THRESHOLD = 0.5;
+const MASK_ALPHA_LOW = 0.35;
+const MASK_ALPHA_HIGH = 0.75;
 
 // 高速レンダリング用のオフスクリーンキャンバス キャッシュ（マスク用 & 人物切り抜き用）
 let maskImageData = null;
@@ -212,7 +218,24 @@ function drawBackground(mode) {
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 }
 
-// Float32の信頼度マスクから、境界線が極めてくっきりしたマスクキャンバスを生成
+function confidenceToAlpha(confidence) {
+  if (maskStyleSelect.value === 'hard') {
+    return confidence >= HARD_MASK_THRESHOLD ? 255 : 0;
+  }
+  const t = Math.max(0, Math.min(1, (confidence - MASK_ALPHA_LOW) / (MASK_ALPHA_HIGH - MASK_ALPHA_LOW)));
+  const smooth = t * t * (3 - 2 * t);
+  return Math.round(smooth * 255);
+}
+
+function getMaskFeatherPx() {
+  return Number(maskFeatherInput.value);
+}
+
+function updateMaskFeatherValue() {
+  maskFeatherValue.textContent = `${getMaskFeatherPx().toFixed(1)}px`;
+}
+
+// Float32の信頼度マスクから、連続的なアルファを持つソフトマスクを生成
 function getMaskCanvas(mask) {
   const w = mask.width;
   const h = mask.height;
@@ -230,13 +253,12 @@ function getMaskCanvas(mask) {
   
   for (let i = 0; i < maskData.length; i++) {
     const confidence = maskData[i];
-    // しきい値（0.5）を用いて2値化し、境界線を極めてくっきり（シャープ）にする
-    const alpha = confidence >= 0.5 ? 255 : 0;
+    const alpha = confidenceToAlpha(confidence);
     const idx = i * 4;
     data[idx] = 255;     // R
     data[idx + 1] = 255; // G
     data[idx + 2] = 255; // B
-    data[idx + 3] = alpha; // A (人物箇所を不透明、背景箇所を透明にマッピング)
+    data[idx + 3] = alpha; // A (人物信頼度に応じて連続的に変化)
   }
   
   maskCtx.putImageData(maskImageData, 0, 0);
@@ -269,8 +291,7 @@ function drawPersonCutout() {
 
   // 2. マスクのアルファを用いてくり抜く（destination-in）
   personCtx.globalCompositeOperation = 'destination-in';
-  // ぼかしを一切適用せず、極めてくっきりした輪郭にする
-  personCtx.filter = 'none';
+  personCtx.filter = getMaskFeatherPx() > 0 ? `blur(${getMaskFeatherPx()}px)` : 'none';
   drawMirroredOnCtx(() => drawCoverImageOnCtx(maskCanvas, personCtx, w, h), personCtx, w);
   personCtx.restore();
 }
@@ -394,6 +415,7 @@ modeSelect.addEventListener('change', updateVisibility);
 
 // Run once initially to hide non-active controls
 updateVisibility();
+updateMaskFeatherValue();
 
 imageInput.addEventListener('change', () => {
   const file = imageInput.files?.[0];
@@ -429,6 +451,15 @@ modelSelect.addEventListener('change', async () => {
     log('Model reinitialization failed', error);
     setStatus('モデル再初期化に失敗しました。カメラ映像のみ表示します。');
   }
+});
+
+maskStyleSelect.addEventListener('change', () => {
+  log('Mask style changed', { style: maskStyleSelect.value });
+});
+
+maskFeatherInput.addEventListener('input', () => {
+  updateMaskFeatherValue();
+  log('Mask feather changed', { px: getMaskFeatherPx() });
 });
 
 startButton.addEventListener('click', start);
