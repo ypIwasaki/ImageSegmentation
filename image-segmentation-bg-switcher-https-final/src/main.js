@@ -18,6 +18,8 @@ const maskAlphaLowInput = document.querySelector('#maskAlphaLowInput');
 const maskAlphaLowValue = document.querySelector('#maskAlphaLowValue');
 const maskAlphaHighInput = document.querySelector('#maskAlphaHighInput');
 const maskAlphaHighValue = document.querySelector('#maskAlphaHighValue');
+const maskMorphInput = document.querySelector('#maskMorphInput');
+const maskMorphValue = document.querySelector('#maskMorphValue');
 const maskFeatherInput = document.querySelector('#maskFeatherInput');
 const maskFeatherValue = document.querySelector('#maskFeatherValue');
 const temporalSmoothingInput = document.querySelector('#temporalSmoothingInput');
@@ -48,6 +50,8 @@ let maskCanvas = null;
 let maskCtx = null;
 let temporalAlphaBuffer = null;
 let temporalAlphaReady = false;
+let alphaMaskBuffer = null;
+let alphaMaskScratchBuffer = null;
 
 let modnetSession = null;
 let modnetInputCanvas = null;
@@ -352,6 +356,15 @@ function updateMaskAlphaValues() {
   maskAlphaHighValue.textContent = getMaskAlphaHigh().toFixed(2);
 }
 
+function getMaskMorphAmount() {
+  return Number(maskMorphInput.value);
+}
+
+function updateMaskMorphValue() {
+  const amount = getMaskMorphAmount();
+  maskMorphValue.textContent = `${amount > 0 ? '+' : ''}${amount}px`;
+}
+
 function getMaskFeatherPx() {
   return Number(maskFeatherInput.value);
 }
@@ -377,6 +390,8 @@ function clearMaskState() {
   maskCanvas = null;
   maskCtx = null;
   maskImageData = null;
+  alphaMaskBuffer = null;
+  alphaMaskScratchBuffer = null;
   resetTemporalSmoothing();
 }
 
@@ -404,6 +419,38 @@ function alphaToCanvasAlpha(alpha) {
   return Math.round(Math.max(0, Math.min(1, alpha)) * 255);
 }
 
+function applyMaskMorphology(srcBuffer, scratchBuffer, w, h, amount) {
+  const radius = Math.abs(amount);
+  if (radius === 0) return srcBuffer;
+
+  const useDilation = amount > 0;
+  for (let y = 0; y < h; y++) {
+    const yStart = Math.max(0, y - radius);
+    const yEnd = Math.min(h - 1, y + radius);
+    for (let x = 0; x < w; x++) {
+      const xStart = Math.max(0, x - radius);
+      const xEnd = Math.min(w - 1, x + radius);
+      let value = useDilation ? 0 : 255;
+
+      for (let yy = yStart; yy <= yEnd; yy++) {
+        const rowOffset = yy * w;
+        for (let xx = xStart; xx <= xEnd; xx++) {
+          const sample = srcBuffer[rowOffset + xx];
+          if (useDilation) {
+            if (sample > value) value = sample;
+          } else if (sample < value) {
+            value = sample;
+          }
+        }
+      }
+
+      scratchBuffer[y * w + x] = value;
+    }
+  }
+
+  return scratchBuffer;
+}
+
 // Float32マスクから、描画用のアルファマスクキャンバスを生成
 function updateMaskCanvasFromArray(maskData, w, h, useDirectAlpha = false) {
   
@@ -416,6 +463,10 @@ function updateMaskCanvasFromArray(maskData, w, h, useDirectAlpha = false) {
     resetTemporalSmoothing();
   }
   const data = maskImageData.data;
+  if (!alphaMaskBuffer || alphaMaskBuffer.length !== maskData.length) {
+    alphaMaskBuffer = new Uint8ClampedArray(maskData.length);
+    alphaMaskScratchBuffer = new Uint8ClampedArray(maskData.length);
+  }
   const temporalSmoothing = getTemporalSmoothing();
   if (temporalSmoothing > 0 && (!temporalAlphaBuffer || temporalAlphaBuffer.length !== maskData.length)) {
     temporalAlphaBuffer = new Float32Array(maskData.length);
@@ -433,14 +484,25 @@ function updateMaskCanvasFromArray(maskData, w, h, useDirectAlpha = false) {
       }
       alpha = Math.round(temporalAlphaBuffer[i]);
     }
+    alphaMaskBuffer[i] = alpha;
+  }
+  if (temporalSmoothing > 0) {
+    temporalAlphaReady = true;
+  }
+
+  const maskAlphaOutput = applyMaskMorphology(
+    alphaMaskBuffer,
+    alphaMaskScratchBuffer,
+    w,
+    h,
+    getMaskMorphAmount(),
+  );
+  for (let i = 0; i < maskAlphaOutput.length; i++) {
     const idx = i * 4;
     data[idx] = 255;     // R
     data[idx + 1] = 255; // G
     data[idx + 2] = 255; // B
-    data[idx + 3] = alpha; // A (人物信頼度に応じて連続的に変化)
-  }
-  if (temporalSmoothing > 0) {
-    temporalAlphaReady = true;
+    data[idx + 3] = maskAlphaOutput[i]; // A (人物信頼度に応じて連続的に変化)
   }
   
   maskCtx.putImageData(maskImageData, 0, 0);
@@ -682,6 +744,7 @@ modeSelect.addEventListener('change', updateVisibility);
 updateVisibility();
 updateModelControlState();
 updateMaskAlphaValues();
+updateMaskMorphValue();
 updateMaskFeatherValue();
 updateTemporalSmoothingValue();
 loadBackgroundImage(defaultBackgroundUrl, DEFAULT_BACKGROUND_NAME);
@@ -728,6 +791,12 @@ maskAlphaHighInput.addEventListener('input', () => {
   updateMaskAlphaValues();
   resetTemporalSmoothing();
   log('Mask alpha high changed', { value: getMaskAlphaHigh() });
+});
+
+maskMorphInput.addEventListener('input', () => {
+  updateMaskMorphValue();
+  resetTemporalSmoothing();
+  log('Mask morphology changed', { amount: getMaskMorphAmount() });
 });
 
 maskFeatherInput.addEventListener('input', () => {
