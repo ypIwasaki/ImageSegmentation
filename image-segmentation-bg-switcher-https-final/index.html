@@ -9,7 +9,7 @@
     <div id="app">
       <header>
         <h1>⚡ Realtime Background Switcher</h1>
-        <p>MediaPipe Selfie Segmentation + 2D Canvas compositing pipeline</p>
+        <p>MediaPipe / MODNet + 2D Canvas compositing pipeline</p>
       </header>
 
       <main class="layout">
@@ -44,8 +44,9 @@
             <label style="margin-top: 4px;">
               AIモデル選択
               <select id="modelSelect">
-                <option value="1" selected>General (高精度)</option>
-                <option value="0">Landscape (軽量 / 高速)</option>
+                <option value="modnet" selected>MODNet (matting / 高品質)</option>
+                <option value="mediapipe-general">MediaPipe General (高精度)</option>
+                <option value="mediapipe-landscape">MediaPipe Landscape (軽量 / 高速)</option>
               </select>
             </label>
 
@@ -124,6 +125,7 @@
         </aside>
       </main>
     </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.21.1/ort.webgpu.min.js"></script>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

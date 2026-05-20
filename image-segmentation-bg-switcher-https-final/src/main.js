@@ -30,11 +30,15 @@ let currentBgUrl = null;
 let segmentBusy = false;
 let lastSegmentAt = 0;
 let frameTimestamp = 0; // MediaPipe用の厳密な単調増加タイムスタンプカウンター
-const SEGMENT_INTERVAL_MS = 33;
+const MEDIAPIPE_SEGMENT_INTERVAL_MS = 33;
+const MODNET_SEGMENT_INTERVAL_MS = 50;
 const HARD_MASK_THRESHOLD = 0.5;
 const MASK_ALPHA_LOW = 0.35;
 const MASK_ALPHA_HIGH = 0.75;
 const DEFAULT_BACKGROUND_NAME = 'AdobeStock_310895879.jpeg';
+const ORT_CDN_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.21.1/';
+const MODNET_MODEL_URL = 'https://huggingface.co/gradio/Modnet/resolve/main/modnet.onnx';
+const MODNET_INPUT_SIZE = 512;
 
 // 高速レンダリング用のオフスクリーンキャンバス キャッシュ（マスク用 & 人物切り抜き用）
 let maskImageData = null;
@@ -42,6 +46,10 @@ let maskCanvas = null;
 let maskCtx = null;
 let temporalAlphaBuffer = null;
 let temporalAlphaReady = false;
+
+let modnetSession = null;
+let modnetInputCanvas = null;
+let modnetInputCtx = null;
 
 let personCanvas = null;
 let personCtx = null;
@@ -83,6 +91,37 @@ function assertBrowserSupport() {
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error('navigator.mediaDevices.getUserMedia が使えません。ブラウザ/URL/権限を確認してください。');
   }
+}
+
+function isModnetSelected() {
+  return modelSelect.value === 'modnet';
+}
+
+function isMediaPipeGeneralSelected() {
+  return modelSelect.value === 'mediapipe-general';
+}
+
+function getSelectedModelLabel() {
+  switch (modelSelect.value) {
+    case 'modnet':
+      return 'MODNet (matting / 高品質)';
+    case 'mediapipe-landscape':
+      return 'MediaPipe Landscape (軽量 / 高速)';
+    case 'mediapipe-general':
+    default:
+      return 'MediaPipe General (高精度)';
+  }
+}
+
+function getSegmentationIntervalMs() {
+  return isModnetSelected() ? MODNET_SEGMENT_INTERVAL_MS : MEDIAPIPE_SEGMENT_INTERVAL_MS;
+}
+
+function getOrt() {
+  if (!window.ort) {
+    throw new Error('ONNX Runtime Web のロードに失敗しました。');
+  }
+  return window.ort;
 }
 
 async function waitForVideoReady() {
@@ -147,12 +186,17 @@ async function initSelfieSegmentation() {
     throw new Error('MediaPipe Tasks Vision library is not loaded.');
   }
 
+  if (selfieSegmentation) {
+    try { selfieSegmentation.close(); } catch {}
+    selfieSegmentation = null;
+  }
+
   log('Initializing modern ImageSegmenter...');
   const vision = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm"
   );
 
-  const isGeneral = Number(modelSelect.value) === 1;
+  const isGeneral = isMediaPipeGeneralSelected();
   const modelAssetPath = isGeneral
     ? "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite"
     : "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter_landscape/float16/latest/selfie_segmenter_landscape.tflite";
@@ -180,6 +224,58 @@ async function initSelfieSegmentation() {
 
   selfieSegmentation = instance;
   log('ImageSegmenter (Tasks Vision) initialized successfully.');
+}
+
+async function initModnet() {
+  const ort = getOrt();
+  ort.env.wasm.numThreads = 1;
+  ort.env.wasm.wasmPaths = ORT_CDN_BASE;
+
+  if (modnetSession) return;
+
+  log('Initializing MODNet portrait matting...');
+  const sessionOptions = {
+    executionProviders: ['webgpu', 'wasm'],
+  };
+
+  try {
+    modnetSession = await ort.InferenceSession.create(MODNET_MODEL_URL, sessionOptions);
+    log('MODNet initialized', { providers: sessionOptions.executionProviders });
+  } catch (error) {
+    log('MODNet WebGPU init failed, retrying with WASM only', error);
+    modnetSession = await ort.InferenceSession.create(MODNET_MODEL_URL, {
+      executionProviders: ['wasm'],
+    });
+    log('MODNet initialized', { providers: ['wasm'] });
+  }
+}
+
+async function initSelectedSegmentationModel() {
+  closeSegmentationEngines();
+  clearMaskState();
+  frameTimestamp = 0;
+  segmentBusy = false;
+  lastSegmentAt = 0;
+
+  if (isModnetSelected()) {
+    setStatus('MODNet を初期化しています... 初回はモデルのダウンロードに時間がかかります。');
+    await initModnet();
+    return;
+  }
+
+  await initSelfieSegmentation();
+}
+
+function closeSegmentationEngines() {
+  if (selfieSegmentation) {
+    try { selfieSegmentation.close(); } catch {}
+  }
+  selfieSegmentation = null;
+
+  if (modnetSession) {
+    try { modnetSession.release?.(); } catch {}
+  }
+  modnetSession = null;
 }
 
 function drawMirroredOnCtx(drawFn, targetCtx, w) {
@@ -225,6 +321,9 @@ function drawBackground(mode) {
 }
 
 function confidenceToAlpha(confidence) {
+  if (isModnetSelected()) {
+    return alphaToCanvasAlpha(confidence);
+  }
   if (maskStyleSelect.value === 'hard') {
     return confidence >= HARD_MASK_THRESHOLD ? 255 : 0;
   }
@@ -254,6 +353,13 @@ function resetTemporalSmoothing() {
   temporalAlphaReady = false;
 }
 
+function clearMaskState() {
+  maskCanvas = null;
+  maskCtx = null;
+  maskImageData = null;
+  resetTemporalSmoothing();
+}
+
 function applyBackgroundImage(img, sourceLabel) {
   backgroundImage = img;
   modeSelect.value = 'image';
@@ -274,10 +380,12 @@ function loadBackgroundImage(url, sourceLabel) {
   img.src = url;
 }
 
-// Float32の信頼度マスクから、連続的なアルファを持つソフトマスクを生成
-function getMaskCanvas(mask) {
-  const w = mask.width;
-  const h = mask.height;
+function alphaToCanvasAlpha(alpha) {
+  return Math.round(Math.max(0, Math.min(1, alpha)) * 255);
+}
+
+// Float32マスクから、描画用のアルファマスクキャンバスを生成
+function updateMaskCanvasFromArray(maskData, w, h, useDirectAlpha = false) {
   
   if (!maskCanvas || maskCanvas.width !== w || maskCanvas.height !== h) {
     maskCanvas = document.createElement('canvas');
@@ -287,9 +395,7 @@ function getMaskCanvas(mask) {
     maskImageData = maskCtx.createImageData(w, h);
     resetTemporalSmoothing();
   }
-  
   const data = maskImageData.data;
-  const maskData = mask.getAsFloat32Array();
   const temporalSmoothing = getTemporalSmoothing();
   if (temporalSmoothing > 0 && (!temporalAlphaBuffer || temporalAlphaBuffer.length !== maskData.length)) {
     temporalAlphaBuffer = new Float32Array(maskData.length);
@@ -297,8 +403,8 @@ function getMaskCanvas(mask) {
   }
   
   for (let i = 0; i < maskData.length; i++) {
-    const confidence = maskData[i];
-    let alpha = confidenceToAlpha(confidence);
+    const value = maskData[i];
+    let alpha = useDirectAlpha ? alphaToCanvasAlpha(value) : confidenceToAlpha(value);
     if (temporalSmoothing > 0) {
       if (!temporalAlphaReady) {
         temporalAlphaBuffer[i] = alpha;
@@ -321,6 +427,40 @@ function getMaskCanvas(mask) {
   return maskCanvas;
 }
 
+function getMaskCanvas(mask) {
+  return updateMaskCanvasFromArray(mask.getAsFloat32Array(), mask.width, mask.height);
+}
+
+function getModnetInputCanvas() {
+  if (!modnetInputCanvas) {
+    modnetInputCanvas = document.createElement('canvas');
+    modnetInputCanvas.width = MODNET_INPUT_SIZE;
+    modnetInputCanvas.height = MODNET_INPUT_SIZE;
+    modnetInputCtx = modnetInputCanvas.getContext('2d', { willReadFrequently: true });
+  }
+  return modnetInputCanvas;
+}
+
+function createModnetInputTensor() {
+  const ort = getOrt();
+  const inputCanvas = getModnetInputCanvas();
+  modnetInputCtx.clearRect(0, 0, inputCanvas.width, inputCanvas.height);
+  modnetInputCtx.drawImage(video, 0, 0, inputCanvas.width, inputCanvas.height);
+
+  const imageData = modnetInputCtx.getImageData(0, 0, inputCanvas.width, inputCanvas.height);
+  const hw = inputCanvas.width * inputCanvas.height;
+  const tensorData = new Float32Array(3 * hw);
+
+  for (let i = 0; i < hw; i++) {
+    const pixelIdx = i * 4;
+    tensorData[i] = (imageData.data[pixelIdx] - 127.5) / 127.5;
+    tensorData[hw + i] = (imageData.data[pixelIdx + 1] - 127.5) / 127.5;
+    tensorData[hw * 2 + i] = (imageData.data[pixelIdx + 2] - 127.5) / 127.5;
+  }
+
+  return new ort.Tensor('float32', tensorData, [1, 3, inputCanvas.height, inputCanvas.width]);
+}
+
 // オフスクリーンキャンバスの初期化と取得
 function getPersonCanvas(w, h) {
   if (!personCanvas || personCanvas.width !== w || personCanvas.height !== h) {
@@ -330,6 +470,14 @@ function getPersonCanvas(w, h) {
     personCtx = personCanvas.getContext('2d');
   }
   return personCanvas;
+}
+
+function drawMaskOnCtx(targetCtx, w, h) {
+  if (isModnetSelected()) {
+    drawMirroredOnCtx(() => targetCtx.drawImage(maskCanvas, 0, 0, w, h), targetCtx, w);
+    return;
+  }
+  drawMirroredOnCtx(() => drawCoverImageOnCtx(maskCanvas, targetCtx, w, h), targetCtx, w);
 }
 
 // メインキャンバスの背景画を巻き添えにせず、人物だけを独立して切り抜いて生成する
@@ -348,7 +496,7 @@ function drawPersonCutout() {
   // 2. マスクのアルファを用いてくり抜く（destination-in）
   personCtx.globalCompositeOperation = 'destination-in';
   personCtx.filter = getMaskFeatherPx() > 0 ? `blur(${getMaskFeatherPx()}px)` : 'none';
-  drawMirroredOnCtx(() => drawCoverImageOnCtx(maskCanvas, personCtx, w, h), personCtx, w);
+  drawMaskOnCtx(personCtx, w, h);
   personCtx.restore();
 }
 
@@ -372,9 +520,9 @@ function drawSegmented() {
   ctx.drawImage(personCanvas, 0, 0);
 }
 
-function requestSegmentationIfNeeded(now) {
+function requestMediaPipeSegmentationIfNeeded(now) {
   if (!selfieSegmentation || segmentBusy) return;
-  if (now - lastSegmentAt < SEGMENT_INTERVAL_MS) return;
+  if (now - lastSegmentAt < getSegmentationIntervalMs()) return;
   lastSegmentAt = now;
   segmentBusy = true;
   try {
@@ -392,6 +540,43 @@ function requestSegmentationIfNeeded(now) {
   } finally {
     segmentBusy = false;
   }
+}
+
+function requestModnetSegmentationIfNeeded(now) {
+  if (!modnetSession || segmentBusy) return;
+  if (now - lastSegmentAt < getSegmentationIntervalMs()) return;
+  lastSegmentAt = now;
+  segmentBusy = true;
+
+  try {
+    const inputTensor = createModnetInputTensor();
+    const feeds = { [modnetSession.inputNames[0]]: inputTensor };
+
+    modnetSession.run(feeds).then((results) => {
+      const outputName = modnetSession.outputNames[0];
+      const outputTensor = results[outputName];
+      updateMaskCanvasFromArray(outputTensor.data, MODNET_INPUT_SIZE, MODNET_INPUT_SIZE, true);
+    }).catch((error) => {
+      log('MODNet inference failed. Falling back to raw preview.', error);
+      setStatus('MODNet推論に失敗しました。カメラ映像のみ表示しています。');
+      modnetSession = null;
+    }).finally(() => {
+      segmentBusy = false;
+    });
+  } catch (error) {
+    log('MODNet preprocessing failed. Falling back to raw preview.', error);
+    setStatus('MODNet前処理に失敗しました。カメラ映像のみ表示しています。');
+    modnetSession = null;
+    segmentBusy = false;
+  }
+}
+
+function requestSegmentationIfNeeded(now) {
+  if (isModnetSelected()) {
+    requestModnetSegmentationIfNeeded(now);
+    return;
+  }
+  requestMediaPipeSegmentationIfNeeded(now);
 }
 
 function renderLoop(now = performance.now()) {
@@ -414,11 +599,11 @@ async function start() {
     renderLoop();
 
     try {
-      await initSelfieSegmentation();
+      await initSelectedSegmentationModel();
       setStatus('背景切り替え有効。モードを変更してください。');
     } catch (error) {
-      log('SelfieSegmentation initialization failed', error);
-      setStatus('MediaPipe初期化に失敗しました。カメラ映像のみ表示します。\n' + error.message);
+      log('Segmentation initialization failed', error);
+      setStatus(`${getSelectedModelLabel()} の初期化に失敗しました。カメラ映像のみ表示します。\n${error.message}`);
     }
   } catch (error) {
     log('Camera start failed', error);
@@ -436,22 +621,15 @@ function stop() {
   }
   stream = null;
   video.srcObject = null;
-  if (selfieSegmentation) {
-    try { selfieSegmentation.close(); } catch (e) {}
-  }
-  selfieSegmentation = null;
+  closeSegmentationEngines();
   frameTimestamp = 0;
-  maskCanvas = null;
-  maskCtx = null;
-  maskImageData = null;
-  resetTemporalSmoothing();
+  clearMaskState();
   personCanvas = null;
   personCtx = null;
-  if (currentBgUrl) {
-    URL.revokeObjectURL(currentBgUrl);
-    currentBgUrl = null;
-  }
-  backgroundImage = null;
+  modnetInputCanvas = null;
+  modnetInputCtx = null;
+  segmentBusy = false;
+  lastSegmentAt = 0;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   startButton.disabled = false;
   stopButton.disabled = true;
@@ -468,10 +646,17 @@ function updateVisibility() {
   imageInputContainer.style.display = mode === 'image' ? 'flex' : 'none';
 }
 
+function updateModelControlState() {
+  const usingModnet = isModnetSelected();
+  maskStyleSelect.disabled = usingModnet;
+  maskStyleSelect.title = usingModnet ? 'MODNet はアルファマットを直接出力するため、この設定は使いません。' : '';
+}
+
 modeSelect.addEventListener('change', updateVisibility);
 
 // Run once initially to hide non-active controls
 updateVisibility();
+updateModelControlState();
 updateMaskFeatherValue();
 updateTemporalSmoothingValue();
 loadBackgroundImage(defaultBackgroundUrl, DEFAULT_BACKGROUND_NAME);
@@ -491,11 +676,11 @@ imageInput.addEventListener('change', () => {
 });
 
 modelSelect.addEventListener('change', async () => {
+  updateModelControlState();
   if (!running) return;
   setStatus('モデル設定を変更しました。再初期化しています...');
-  resetTemporalSmoothing();
   try {
-    await initSelfieSegmentation();
+    await initSelectedSegmentationModel();
     setStatus('背景切り替え有効。');
   } catch (error) {
     log('Model reinitialization failed', error);
