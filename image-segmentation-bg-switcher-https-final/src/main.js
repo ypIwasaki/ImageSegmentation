@@ -15,6 +15,8 @@ const modelSelect = document.querySelector('#modelSelect');
 const maskStyleSelect = document.querySelector('#maskStyleSelect');
 const maskFeatherInput = document.querySelector('#maskFeatherInput');
 const maskFeatherValue = document.querySelector('#maskFeatherValue');
+const temporalSmoothingInput = document.querySelector('#temporalSmoothingInput');
+const temporalSmoothingValue = document.querySelector('#temporalSmoothingValue');
 const statusEl = document.querySelector('#status');
 const debugEl = document.querySelector('#debugLog');
 
@@ -36,6 +38,8 @@ const MASK_ALPHA_HIGH = 0.75;
 let maskImageData = null;
 let maskCanvas = null;
 let maskCtx = null;
+let temporalAlphaBuffer = null;
+let temporalAlphaReady = false;
 
 let personCanvas = null;
 let personCtx = null;
@@ -235,6 +239,19 @@ function updateMaskFeatherValue() {
   maskFeatherValue.textContent = `${getMaskFeatherPx().toFixed(1)}px`;
 }
 
+function getTemporalSmoothing() {
+  return Number(temporalSmoothingInput.value);
+}
+
+function updateTemporalSmoothingValue() {
+  temporalSmoothingValue.textContent = `${Math.round(getTemporalSmoothing() * 100)}%`;
+}
+
+function resetTemporalSmoothing() {
+  temporalAlphaBuffer = null;
+  temporalAlphaReady = false;
+}
+
 // Float32の信頼度マスクから、連続的なアルファを持つソフトマスクを生成
 function getMaskCanvas(mask) {
   const w = mask.width;
@@ -246,19 +263,36 @@ function getMaskCanvas(mask) {
     maskCanvas.height = h;
     maskCtx = maskCanvas.getContext('2d');
     maskImageData = maskCtx.createImageData(w, h);
+    resetTemporalSmoothing();
   }
   
   const data = maskImageData.data;
   const maskData = mask.getAsFloat32Array();
+  const temporalSmoothing = getTemporalSmoothing();
+  if (temporalSmoothing > 0 && (!temporalAlphaBuffer || temporalAlphaBuffer.length !== maskData.length)) {
+    temporalAlphaBuffer = new Float32Array(maskData.length);
+    temporalAlphaReady = false;
+  }
   
   for (let i = 0; i < maskData.length; i++) {
     const confidence = maskData[i];
-    const alpha = confidenceToAlpha(confidence);
+    let alpha = confidenceToAlpha(confidence);
+    if (temporalSmoothing > 0) {
+      if (!temporalAlphaReady) {
+        temporalAlphaBuffer[i] = alpha;
+      } else {
+        temporalAlphaBuffer[i] = temporalAlphaBuffer[i] * temporalSmoothing + alpha * (1 - temporalSmoothing);
+      }
+      alpha = Math.round(temporalAlphaBuffer[i]);
+    }
     const idx = i * 4;
     data[idx] = 255;     // R
     data[idx + 1] = 255; // G
     data[idx + 2] = 255; // B
     data[idx + 3] = alpha; // A (人物信頼度に応じて連続的に変化)
+  }
+  if (temporalSmoothing > 0) {
+    temporalAlphaReady = true;
   }
   
   maskCtx.putImageData(maskImageData, 0, 0);
@@ -388,6 +422,7 @@ function stop() {
   maskCanvas = null;
   maskCtx = null;
   maskImageData = null;
+  resetTemporalSmoothing();
   personCanvas = null;
   personCtx = null;
   if (currentBgUrl) {
@@ -416,6 +451,7 @@ modeSelect.addEventListener('change', updateVisibility);
 // Run once initially to hide non-active controls
 updateVisibility();
 updateMaskFeatherValue();
+updateTemporalSmoothingValue();
 
 imageInput.addEventListener('change', () => {
   const file = imageInput.files?.[0];
@@ -444,6 +480,7 @@ imageInput.addEventListener('change', () => {
 modelSelect.addEventListener('change', async () => {
   if (!running) return;
   setStatus('モデル設定を変更しました。再初期化しています...');
+  resetTemporalSmoothing();
   try {
     await initSelfieSegmentation();
     setStatus('背景切り替え有効。');
@@ -454,12 +491,19 @@ modelSelect.addEventListener('change', async () => {
 });
 
 maskStyleSelect.addEventListener('change', () => {
+  resetTemporalSmoothing();
   log('Mask style changed', { style: maskStyleSelect.value });
 });
 
 maskFeatherInput.addEventListener('input', () => {
   updateMaskFeatherValue();
   log('Mask feather changed', { px: getMaskFeatherPx() });
+});
+
+temporalSmoothingInput.addEventListener('input', () => {
+  updateTemporalSmoothingValue();
+  resetTemporalSmoothing();
+  log('Temporal smoothing changed', { ratio: getTemporalSmoothing() });
 });
 
 startButton.addEventListener('click', start);
