@@ -218,6 +218,18 @@ button {
   transform: translateY(-1px);
 }
 
+.secondary-button {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+}
+
+.secondary-button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text-primary);
+  transform: translateY(-1px);
+}
+
 button:active:not(:disabled) {
   transform: translateY(1px);
 }

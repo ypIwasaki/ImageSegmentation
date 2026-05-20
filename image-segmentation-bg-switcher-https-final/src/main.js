@@ -1,6 +1,6 @@
 import './styles.css';
 import { ImageSegmenter, FilesetResolver } from '@mediapipe/tasks-vision';
-import defaultBackgroundUrl from '../../images/AdobeStock_310895879.jpeg';
+import defaultBackgroundUrl from '../../images/AdobeStock_310895879.optimized.webp';
 
 const video = document.querySelector('#cameraVideo');
 const canvas = document.querySelector('#outputCanvas');
@@ -13,6 +13,9 @@ const colorInput = document.querySelector('#colorInput');
 const imageInput = document.querySelector('#imageInput');
 const mirrorInput = document.querySelector('#mirrorInput');
 const modelSelect = document.querySelector('#modelSelect');
+const computeDeviceSelect = document.querySelector('#computeDeviceSelect');
+const loadDefaultImageButton = document.querySelector('#loadDefaultImageButton');
+const resetComparisonButton = document.querySelector('#resetComparisonButton');
 const maskStyleSelect = document.querySelector('#maskStyleSelect');
 const maskAlphaLowInput = document.querySelector('#maskAlphaLowInput');
 const maskAlphaLowValue = document.querySelector('#maskAlphaLowValue');
@@ -27,35 +30,53 @@ const temporalSmoothingValue = document.querySelector('#temporalSmoothingValue')
 const statusEl = document.querySelector('#status');
 const debugEl = document.querySelector('#debugLog');
 
+const colorPickerContainer = document.querySelector('#colorPickerContainer');
+const imageInputContainer = document.querySelector('#imageInputContainer');
+
+const SEGMENT_INTERVAL_MS = 33;
+const HARD_MASK_THRESHOLD = 0.5;
+const ALPHA_LUT_SIZE = 1024;
+const DEFAULT_BACKGROUND_NAME = 'AdobeStock_310895879.optimized.webp';
+
 let stream = null;
-let selfieSegmentation = null;
+let segmenter = null;
 let running = false;
 let rafId = 0;
 let backgroundImage = null;
 let currentBgUrl = null;
+let backgroundCanvas = null;
+let backgroundCtx = null;
+let backgroundCacheKey = '';
 let segmentBusy = false;
 let lastSegmentAt = 0;
-let frameTimestamp = 0; // MediaPipe用の厳密な単調増加タイムスタンプカウンター
-const MEDIAPIPE_SEGMENT_INTERVAL_MS = 33;
-const MODNET_SEGMENT_INTERVAL_MS = 50;
-const HARD_MASK_THRESHOLD = 0.5;
-const DEFAULT_BACKGROUND_NAME = 'AdobeStock_310895879.jpeg';
-const ORT_CDN_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.21.1/';
-const MODNET_MODEL_URL = 'https://huggingface.co/gradio/Modnet/resolve/main/modnet.onnx';
-const MODNET_INPUT_SIZE = 512;
+let frameTimestamp = 0;
 
-// 高速レンダリング用のオフスクリーンキャンバス キャッシュ（マスク用 & 人物切り抜き用）
 let maskImageData = null;
 let maskCanvas = null;
 let maskCtx = null;
+let filteredMaskCanvas = null;
+let filteredMaskCtx = null;
+let featherWorkCanvas = null;
+let featherWorkCtx = null;
+let activeMaskCanvas = null;
 let temporalAlphaBuffer = null;
 let temporalAlphaReady = false;
 let alphaMaskBuffer = null;
 let alphaMaskScratchBuffer = null;
+let lastConfidenceMask = null;
+let lastMaskWidth = 0;
+let lastMaskHeight = 0;
+let maskAlphaLut = null;
+let maskAlphaLutDirty = true;
 
-let modnetSession = null;
-let modnetInputCanvas = null;
-let modnetInputCtx = null;
+const maskSettings = {
+  style: 'hard',
+  alphaLow: 0.35,
+  alphaHigh: 0.75,
+  morphAmount: 0,
+  featherPx: 0,
+  temporalSmoothing: 0,
+};
 
 let personCanvas = null;
 let personCtx = null;
@@ -99,35 +120,20 @@ function assertBrowserSupport() {
   }
 }
 
-function isModnetSelected() {
-  return modelSelect.value === 'modnet';
+function isGeneralSelected() {
+  return Number(modelSelect.value) === 1;
 }
 
-function isMediaPipeGeneralSelected() {
-  return modelSelect.value === 'mediapipe-general';
+function isCpuSelected() {
+  return computeDeviceSelect.value === 'cpu';
 }
 
 function getSelectedModelLabel() {
-  switch (modelSelect.value) {
-    case 'modnet':
-      return 'MODNet (matting / 高品質)';
-    case 'mediapipe-landscape':
-      return 'MediaPipe Landscape (軽量 / 高速)';
-    case 'mediapipe-general':
-    default:
-      return 'MediaPipe General (高精度)';
-  }
+  return isGeneralSelected() ? 'General (高精度)' : 'Landscape (軽量 / 高速)';
 }
 
-function getSegmentationIntervalMs() {
-  return isModnetSelected() ? MODNET_SEGMENT_INTERVAL_MS : MEDIAPIPE_SEGMENT_INTERVAL_MS;
-}
-
-function getOrt() {
-  if (!window.ort) {
-    throw new Error('ONNX Runtime Web のロードに失敗しました。');
-  }
-  return window.ort;
+function getSelectedComputeDeviceLabel() {
+  return isCpuSelected() ? 'CPU' : 'GPU';
 }
 
 async function waitForVideoReady() {
@@ -164,6 +170,7 @@ function resizeCanvasToVideo() {
   if (canvas.width !== w || canvas.height !== h) {
     canvas.width = w;
     canvas.height = h;
+    backgroundCacheKey = '';
     log('Canvas resized', { w, h });
   }
 }
@@ -187,107 +194,59 @@ async function startCameraOnly() {
   log('Camera started', { width: video.videoWidth, height: video.videoHeight });
 }
 
-async function initSelfieSegmentation() {
+function closeSegmenter() {
+  if (segmenter) {
+    try { segmenter.close(); } catch {}
+  }
+  segmenter = null;
+}
+
+async function initSegmenter() {
   if (!ImageSegmenter || !FilesetResolver) {
     throw new Error('MediaPipe Tasks Vision library is not loaded.');
   }
 
-  if (selfieSegmentation) {
-    try { selfieSegmentation.close(); } catch {}
-    selfieSegmentation = null;
-  }
+  closeSegmenter();
 
   log('Initializing modern ImageSegmenter...');
   const vision = await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm"
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm'
   );
 
-  const isGeneral = isMediaPipeGeneralSelected();
-  const modelAssetPath = isGeneral
-    ? "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite"
-    : "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter_landscape/float16/latest/selfie_segmenter_landscape.tflite";
+  const modelAssetPath = isGeneralSelected()
+    ? 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite'
+    : 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter_landscape/float16/latest/selfie_segmenter_landscape.tflite';
 
-  log(`Loading model: ${isGeneral ? 'General (高精度)' : 'Landscape (軽量)'}`);
+  log(`Loading model: ${getSelectedModelLabel()}`, { delegate: getSelectedComputeDeviceLabel() });
 
-  const instance = await ImageSegmenter.createFromOptions(vision, {
+  segmenter = await ImageSegmenter.createFromOptions(vision, {
     baseOptions: {
-      modelAssetPath: modelAssetPath,
-      delegate: "GPU"
+      modelAssetPath,
+      delegate: isCpuSelected() ? 'CPU' : 'GPU',
     },
-    runningMode: "VIDEO",
+    runningMode: 'VIDEO',
     outputCategoryMask: false,
-    outputConfidenceMasks: true
+    outputConfidenceMasks: true,
   });
 
-  // ウォームアップ推論（callback経由で結果を即時安全キャッシュ）
   frameTimestamp = 0;
-  instance.segmentForVideo(video, frameTimestamp, (result) => {
-    if (result && result.confidenceMasks && result.confidenceMasks.length > 0) {
-      getMaskCanvas(result.confidenceMasks[0]);
+  segmenter.segmentForVideo(video, frameTimestamp, (result) => {
+    if (result?.confidenceMasks?.length) {
+      const mask = result.confidenceMasks[0];
+      updateMaskCanvasFromArray(mask.getAsFloat32Array(), mask.width, mask.height, true);
     }
   });
   frameTimestamp += 33;
 
-  selfieSegmentation = instance;
-  log('ImageSegmenter (Tasks Vision) initialized successfully.');
-}
-
-async function initModnet() {
-  const ort = getOrt();
-  ort.env.wasm.numThreads = 1;
-  ort.env.wasm.wasmPaths = ORT_CDN_BASE;
-
-  if (modnetSession) return;
-
-  log('Initializing MODNet portrait matting...');
-  const sessionOptions = {
-    executionProviders: ['webgpu', 'wasm'],
-  };
-
-  try {
-    modnetSession = await ort.InferenceSession.create(MODNET_MODEL_URL, sessionOptions);
-    log('MODNet initialized', { providers: sessionOptions.executionProviders });
-  } catch (error) {
-    log('MODNet WebGPU init failed, retrying with WASM only', error);
-    modnetSession = await ort.InferenceSession.create(MODNET_MODEL_URL, {
-      executionProviders: ['wasm'],
-    });
-    log('MODNet initialized', { providers: ['wasm'] });
-  }
-}
-
-async function initSelectedSegmentationModel() {
-  closeSegmentationEngines();
-  clearMaskState();
-  frameTimestamp = 0;
-  segmentBusy = false;
-  lastSegmentAt = 0;
-
-  if (isModnetSelected()) {
-    setStatus('MODNet を初期化しています... 初回はモデルのダウンロードに時間がかかります。');
-    await initModnet();
-    return;
-  }
-
-  await initSelfieSegmentation();
-}
-
-function closeSegmentationEngines() {
-  if (selfieSegmentation) {
-    try { selfieSegmentation.close(); } catch {}
-  }
-  selfieSegmentation = null;
-
-  if (modnetSession) {
-    try { modnetSession.release?.(); } catch {}
-  }
-  modnetSession = null;
+  log('ImageSegmenter initialized successfully.', {
+    model: getSelectedModelLabel(),
+    delegate: getSelectedComputeDeviceLabel(),
+  });
 }
 
 function drawMirroredOnCtx(drawFn, targetCtx, w) {
-  const mirror = mirrorInput.checked;
   targetCtx.save();
-  if (mirror) {
+  if (mirrorInput.checked) {
     targetCtx.translate(w, 0);
     targetCtx.scale(-1, 1);
   }
@@ -312,6 +271,30 @@ function drawRaw() {
   drawMirroredOnCtx(() => drawCoverImageOnCtx(video, ctx, canvas.width, canvas.height), ctx, canvas.width);
 }
 
+function getBackgroundCacheCanvas() {
+  if (!backgroundCanvas) {
+    backgroundCanvas = document.createElement('canvas');
+    backgroundCtx = backgroundCanvas.getContext('2d');
+  }
+  return backgroundCanvas;
+}
+
+function drawCachedBackground() {
+  if (!backgroundImage || !canvas.width || !canvas.height) return;
+
+  const cacheCanvas = getBackgroundCacheCanvas();
+  const cacheKey = `${canvas.width}x${canvas.height}:${backgroundImage.naturalWidth}x${backgroundImage.naturalHeight}`;
+  if (backgroundCacheKey !== cacheKey) {
+    cacheCanvas.width = canvas.width;
+    cacheCanvas.height = canvas.height;
+    backgroundCtx.clearRect(0, 0, cacheCanvas.width, cacheCanvas.height);
+    drawCoverImageOnCtx(backgroundImage, backgroundCtx, cacheCanvas.width, cacheCanvas.height);
+    backgroundCacheKey = cacheKey;
+  }
+
+  ctx.drawImage(cacheCanvas, 0, 0);
+}
+
 function drawBackground(mode) {
   if (mode === 'color') {
     ctx.fillStyle = colorInput.value;
@@ -319,33 +302,19 @@ function drawBackground(mode) {
     return;
   }
   if (mode === 'image' && backgroundImage) {
-    drawCoverImageOnCtx(backgroundImage, ctx, canvas.width, canvas.height);
+    drawCachedBackground();
     return;
   }
   ctx.fillStyle = '#0d1117';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 }
 
-function confidenceToAlpha(confidence) {
-  if (isModnetSelected()) {
-    return alphaToCanvasAlpha(confidence);
-  }
-  if (maskStyleSelect.value === 'hard') {
-    return confidence >= HARD_MASK_THRESHOLD ? 255 : 0;
-  }
-  const low = getMaskAlphaLow();
-  const high = getMaskAlphaHigh();
-  const t = Math.max(0, Math.min(1, (confidence - low) / Math.max(high - low, 0.0001)));
-  const smooth = t * t * (3 - 2 * t);
-  return Math.round(smooth * 255);
-}
-
 function getMaskAlphaLow() {
-  return Number(maskAlphaLowInput.value);
+  return maskSettings.alphaLow;
 }
 
 function getMaskAlphaHigh() {
-  return Math.max(Number(maskAlphaHighInput.value), getMaskAlphaLow() + 0.01);
+  return maskSettings.alphaHigh;
 }
 
 function updateMaskAlphaValues() {
@@ -357,7 +326,7 @@ function updateMaskAlphaValues() {
 }
 
 function getMaskMorphAmount() {
-  return Number(maskMorphInput.value);
+  return maskSettings.morphAmount;
 }
 
 function updateMaskMorphValue() {
@@ -366,7 +335,7 @@ function updateMaskMorphValue() {
 }
 
 function getMaskFeatherPx() {
-  return Number(maskFeatherInput.value);
+  return maskSettings.featherPx;
 }
 
 function updateMaskFeatherValue() {
@@ -374,11 +343,68 @@ function updateMaskFeatherValue() {
 }
 
 function getTemporalSmoothing() {
-  return Number(temporalSmoothingInput.value);
+  return maskSettings.temporalSmoothing;
 }
 
 function updateTemporalSmoothingValue() {
   temporalSmoothingValue.textContent = `${Math.round(getTemporalSmoothing() * 100)}%`;
+}
+
+function syncMaskSettingsFromUI() {
+  const nextLow = Number(maskAlphaLowInput.value);
+  const nextHigh = Math.max(Number(maskAlphaHighInput.value), nextLow + 0.01);
+  const nextStyle = maskStyleSelect.value;
+  const nextMorphAmount = Number(maskMorphInput.value);
+  const nextFeatherPx = Number(maskFeatherInput.value);
+  const nextTemporalSmoothing = Number(temporalSmoothingInput.value);
+
+  const lutChanged = (
+    maskSettings.style !== nextStyle ||
+    maskSettings.alphaLow !== nextLow ||
+    maskSettings.alphaHigh !== nextHigh
+  );
+
+  maskSettings.style = nextStyle;
+  maskSettings.alphaLow = nextLow;
+  maskSettings.alphaHigh = nextHigh;
+  maskSettings.morphAmount = nextMorphAmount;
+  maskSettings.featherPx = nextFeatherPx;
+  maskSettings.temporalSmoothing = nextTemporalSmoothing;
+
+  if (lutChanged) {
+    maskAlphaLutDirty = true;
+  }
+}
+
+function ensureMaskAlphaLut() {
+  if (!maskAlphaLut) {
+    maskAlphaLut = new Uint8ClampedArray(ALPHA_LUT_SIZE + 1);
+    maskAlphaLutDirty = true;
+  }
+  if (!maskAlphaLutDirty) return;
+
+  for (let i = 0; i <= ALPHA_LUT_SIZE; i++) {
+    const confidence = i / ALPHA_LUT_SIZE;
+    let alpha;
+    if (maskSettings.style === 'hard') {
+      alpha = confidence >= HARD_MASK_THRESHOLD ? 255 : 0;
+    } else {
+      const t = Math.max(
+        0,
+        Math.min(1, (confidence - maskSettings.alphaLow) / Math.max(maskSettings.alphaHigh - maskSettings.alphaLow, 0.0001))
+      );
+      const smooth = t * t * (3 - 2 * t);
+      alpha = Math.round(smooth * 255);
+    }
+    maskAlphaLut[i] = alpha;
+  }
+
+  maskAlphaLutDirty = false;
+}
+
+function confidenceToAlpha(confidence) {
+  const index = Math.max(0, Math.min(ALPHA_LUT_SIZE, (confidence * ALPHA_LUT_SIZE) | 0));
+  return maskAlphaLut[index];
 }
 
 function resetTemporalSmoothing() {
@@ -387,16 +413,71 @@ function resetTemporalSmoothing() {
 }
 
 function clearMaskState() {
+  maskImageData = null;
   maskCanvas = null;
   maskCtx = null;
-  maskImageData = null;
+  filteredMaskCanvas = null;
+  filteredMaskCtx = null;
+  featherWorkCanvas = null;
+  featherWorkCtx = null;
+  activeMaskCanvas = null;
   alphaMaskBuffer = null;
   alphaMaskScratchBuffer = null;
+  lastConfidenceMask = null;
+  lastMaskWidth = 0;
+  lastMaskHeight = 0;
   resetTemporalSmoothing();
+}
+
+function revokeCurrentBackgroundUrl() {
+  if (currentBgUrl) {
+    URL.revokeObjectURL(currentBgUrl);
+    currentBgUrl = null;
+  }
+}
+
+function ensureMaskCanvases(w, h) {
+  if (!maskCanvas || maskCanvas.width !== w || maskCanvas.height !== h) {
+    maskCanvas = document.createElement('canvas');
+    maskCanvas.width = w;
+    maskCanvas.height = h;
+    maskCtx = maskCanvas.getContext('2d');
+    maskImageData = maskCtx.createImageData(w, h);
+    filteredMaskCanvas = null;
+    filteredMaskCtx = null;
+    activeMaskCanvas = maskCanvas;
+    resetTemporalSmoothing();
+  }
+}
+
+function ensureFilteredMaskCanvas(w, h) {
+  if (!filteredMaskCanvas || filteredMaskCanvas.width !== w || filteredMaskCanvas.height !== h) {
+    filteredMaskCanvas = document.createElement('canvas');
+    filteredMaskCanvas.width = w;
+    filteredMaskCanvas.height = h;
+    filteredMaskCtx = filteredMaskCanvas.getContext('2d');
+  }
+}
+
+function ensureFeatherWorkCanvas(w, h) {
+  if (!featherWorkCanvas || featherWorkCanvas.width !== w || featherWorkCanvas.height !== h) {
+    featherWorkCanvas = document.createElement('canvas');
+    featherWorkCanvas.width = w;
+    featherWorkCanvas.height = h;
+    featherWorkCtx = featherWorkCanvas.getContext('2d');
+  }
+}
+
+function ensureAlphaBuffers(length) {
+  if (!alphaMaskBuffer || alphaMaskBuffer.length !== length) {
+    alphaMaskBuffer = new Uint8ClampedArray(length);
+    alphaMaskScratchBuffer = new Uint8ClampedArray(length);
+  }
 }
 
 function applyBackgroundImage(img, sourceLabel) {
   backgroundImage = img;
+  backgroundCacheKey = '';
   modeSelect.value = 'image';
   updateVisibility();
   log('Background image loaded', {
@@ -415,67 +496,134 @@ function loadBackgroundImage(url, sourceLabel) {
   img.src = url;
 }
 
-function alphaToCanvasAlpha(alpha) {
-  return Math.round(Math.max(0, Math.min(1, alpha)) * 255);
+function getScaledMaskFeatherPx(w, h) {
+  const scaleX = w / Math.max(canvas.width, 1);
+  const scaleY = h / Math.max(canvas.height, 1);
+  return Math.max(0.01, getMaskFeatherPx() * Math.max(scaleX, scaleY));
 }
 
-function applyMaskMorphology(srcBuffer, scratchBuffer, w, h, amount) {
+function applyMaskMorphologyInPlace(buffer, scratch, w, h, amount) {
   const radius = Math.abs(amount);
-  if (radius === 0) return srcBuffer;
+  if (radius === 0) return;
 
   const useDilation = amount > 0;
+
   for (let y = 0; y < h; y++) {
-    const yStart = Math.max(0, y - radius);
-    const yEnd = Math.min(h - 1, y + radius);
+    const rowOffset = y * w;
     for (let x = 0; x < w; x++) {
       const xStart = Math.max(0, x - radius);
       const xEnd = Math.min(w - 1, x + radius);
       let value = useDilation ? 0 : 255;
 
-      for (let yy = yStart; yy <= yEnd; yy++) {
-        const rowOffset = yy * w;
-        for (let xx = xStart; xx <= xEnd; xx++) {
-          const sample = srcBuffer[rowOffset + xx];
-          if (useDilation) {
-            if (sample > value) value = sample;
-          } else if (sample < value) {
-            value = sample;
-          }
+      for (let xx = xStart; xx <= xEnd; xx++) {
+        const sample = buffer[rowOffset + xx];
+        if (useDilation) {
+          if (sample > value) value = sample;
+        } else if (sample < value) {
+          value = sample;
         }
       }
 
-      scratchBuffer[y * w + x] = value;
+      scratch[rowOffset + x] = value;
     }
   }
 
-  return scratchBuffer;
+  for (let y = 0; y < h; y++) {
+    const yStart = Math.max(0, y - radius);
+    const yEnd = Math.min(h - 1, y + radius);
+    for (let x = 0; x < w; x++) {
+      let value = useDilation ? 0 : 255;
+
+      for (let yy = yStart; yy <= yEnd; yy++) {
+        const sample = scratch[yy * w + x];
+        if (useDilation) {
+          if (sample > value) value = sample;
+        } else if (sample < value) {
+          value = sample;
+        }
+      }
+
+      buffer[y * w + x] = value;
+    }
+  }
 }
 
-// Float32マスクから、描画用のアルファマスクキャンバスを生成
-function updateMaskCanvasFromArray(maskData, w, h, useDirectAlpha = false) {
-  
-  if (!maskCanvas || maskCanvas.width !== w || maskCanvas.height !== h) {
-    maskCanvas = document.createElement('canvas');
-    maskCanvas.width = w;
-    maskCanvas.height = h;
-    maskCtx = maskCanvas.getContext('2d');
-    maskImageData = maskCtx.createImageData(w, h);
+function renderMaskCanvasFromAlphaBuffer(w, h) {
+  if (!maskImageData || !alphaMaskBuffer) return;
+
+  const data = maskImageData.data;
+  for (let i = 0; i < alphaMaskBuffer.length; i++) {
+    const idx = i * 4;
+    data[idx] = 255;
+    data[idx + 1] = 255;
+    data[idx + 2] = 255;
+    data[idx + 3] = alphaMaskBuffer[i];
+  }
+
+  maskCtx.putImageData(maskImageData, 0, 0);
+
+  if (getMaskFeatherPx() <= 0) {
+    activeMaskCanvas = maskCanvas;
+    return;
+  }
+
+  const featherPx = getScaledMaskFeatherPx(w, h);
+  const useDownsampledFeather = w * h >= 65536;
+  ensureFilteredMaskCanvas(w, h);
+
+  if (useDownsampledFeather) {
+    const workScale = 0.5;
+    const workWidth = Math.max(1, Math.round(w * workScale));
+    const workHeight = Math.max(1, Math.round(h * workScale));
+    ensureFeatherWorkCanvas(workWidth, workHeight);
+
+    featherWorkCtx.clearRect(0, 0, workWidth, workHeight);
+    featherWorkCtx.save();
+    featherWorkCtx.filter = `blur(${Math.max(0.01, featherPx * workScale)}px)`;
+    featherWorkCtx.drawImage(maskCanvas, 0, 0, workWidth, workHeight);
+    featherWorkCtx.restore();
+
+    filteredMaskCtx.clearRect(0, 0, w, h);
+    filteredMaskCtx.imageSmoothingEnabled = true;
+    filteredMaskCtx.drawImage(featherWorkCanvas, 0, 0, w, h);
+  } else {
+    filteredMaskCtx.clearRect(0, 0, w, h);
+    filteredMaskCtx.save();
+    filteredMaskCtx.filter = `blur(${featherPx}px)`;
+    filteredMaskCtx.drawImage(maskCanvas, 0, 0);
+    filteredMaskCtx.restore();
+  }
+
+  activeMaskCanvas = filteredMaskCanvas;
+}
+
+function updateMaskCanvasFromArray(maskData, w, h, storeMaskData = false) {
+  ensureMaskCanvases(w, h);
+  ensureAlphaBuffers(maskData.length);
+  ensureMaskAlphaLut();
+
+  if (storeMaskData) {
+    if (!lastConfidenceMask || lastConfidenceMask.length !== maskData.length) {
+      lastConfidenceMask = new Float32Array(maskData.length);
+    }
+    lastConfidenceMask.set(maskData);
+    lastMaskWidth = w;
+    lastMaskHeight = h;
+  }
+
+  const sourceData = storeMaskData ? lastConfidenceMask : maskData;
+  const temporalSmoothing = maskSettings.temporalSmoothing;
+  if (temporalSmoothing > 0) {
+    if (!temporalAlphaBuffer || temporalAlphaBuffer.length !== sourceData.length) {
+      temporalAlphaBuffer = new Float32Array(sourceData.length);
+      temporalAlphaReady = false;
+    }
+  } else {
     resetTemporalSmoothing();
   }
-  const data = maskImageData.data;
-  if (!alphaMaskBuffer || alphaMaskBuffer.length !== maskData.length) {
-    alphaMaskBuffer = new Uint8ClampedArray(maskData.length);
-    alphaMaskScratchBuffer = new Uint8ClampedArray(maskData.length);
-  }
-  const temporalSmoothing = getTemporalSmoothing();
-  if (temporalSmoothing > 0 && (!temporalAlphaBuffer || temporalAlphaBuffer.length !== maskData.length)) {
-    temporalAlphaBuffer = new Float32Array(maskData.length);
-    temporalAlphaReady = false;
-  }
-  
-  for (let i = 0; i < maskData.length; i++) {
-    const value = maskData[i];
-    let alpha = useDirectAlpha ? alphaToCanvasAlpha(value) : confidenceToAlpha(value);
+
+  for (let i = 0; i < sourceData.length; i++) {
+    let alpha = confidenceToAlpha(sourceData[i]);
     if (temporalSmoothing > 0) {
       if (!temporalAlphaReady) {
         temporalAlphaBuffer[i] = alpha;
@@ -486,64 +634,29 @@ function updateMaskCanvasFromArray(maskData, w, h, useDirectAlpha = false) {
     }
     alphaMaskBuffer[i] = alpha;
   }
+
   if (temporalSmoothing > 0) {
     temporalAlphaReady = true;
   }
 
-  const maskAlphaOutput = applyMaskMorphology(
-    alphaMaskBuffer,
-    alphaMaskScratchBuffer,
-    w,
-    h,
-    getMaskMorphAmount(),
-  );
-  for (let i = 0; i < maskAlphaOutput.length; i++) {
-    const idx = i * 4;
-    data[idx] = 255;     // R
-    data[idx + 1] = 255; // G
-    data[idx + 2] = 255; // B
-    data[idx + 3] = maskAlphaOutput[i]; // A (人物信頼度に応じて連続的に変化)
-  }
-  
-  maskCtx.putImageData(maskImageData, 0, 0);
-  return maskCanvas;
-}
-
-function getMaskCanvas(mask) {
-  return updateMaskCanvasFromArray(mask.getAsFloat32Array(), mask.width, mask.height);
-}
-
-function getModnetInputCanvas() {
-  if (!modnetInputCanvas) {
-    modnetInputCanvas = document.createElement('canvas');
-    modnetInputCanvas.width = MODNET_INPUT_SIZE;
-    modnetInputCanvas.height = MODNET_INPUT_SIZE;
-    modnetInputCtx = modnetInputCanvas.getContext('2d', { willReadFrequently: true });
-  }
-  return modnetInputCanvas;
-}
-
-function createModnetInputTensor() {
-  const ort = getOrt();
-  const inputCanvas = getModnetInputCanvas();
-  modnetInputCtx.clearRect(0, 0, inputCanvas.width, inputCanvas.height);
-  modnetInputCtx.drawImage(video, 0, 0, inputCanvas.width, inputCanvas.height);
-
-  const imageData = modnetInputCtx.getImageData(0, 0, inputCanvas.width, inputCanvas.height);
-  const hw = inputCanvas.width * inputCanvas.height;
-  const tensorData = new Float32Array(3 * hw);
-
-  for (let i = 0; i < hw; i++) {
-    const pixelIdx = i * 4;
-    tensorData[i] = (imageData.data[pixelIdx] - 127.5) / 127.5;
-    tensorData[hw + i] = (imageData.data[pixelIdx + 1] - 127.5) / 127.5;
-    tensorData[hw * 2 + i] = (imageData.data[pixelIdx + 2] - 127.5) / 127.5;
+  if (maskSettings.morphAmount !== 0) {
+    applyMaskMorphologyInPlace(alphaMaskBuffer, alphaMaskScratchBuffer, w, h, maskSettings.morphAmount);
   }
 
-  return new ort.Tensor('float32', tensorData, [1, 3, inputCanvas.height, inputCanvas.width]);
+  renderMaskCanvasFromAlphaBuffer(w, h);
+  return activeMaskCanvas;
 }
 
-// オフスクリーンキャンバスの初期化と取得
+function refreshMaskCanvas() {
+  if (!lastConfidenceMask || !lastMaskWidth || !lastMaskHeight) return;
+  updateMaskCanvasFromArray(lastConfidenceMask, lastMaskWidth, lastMaskHeight, false);
+}
+
+function rerenderMaskCanvas() {
+  if (!alphaMaskBuffer || !lastMaskWidth || !lastMaskHeight) return;
+  renderMaskCanvasFromAlphaBuffer(lastMaskWidth, lastMaskHeight);
+}
+
 function getPersonCanvas(w, h) {
   if (!personCanvas || personCanvas.width !== w || personCanvas.height !== h) {
     personCanvas = document.createElement('canvas');
@@ -555,110 +668,58 @@ function getPersonCanvas(w, h) {
 }
 
 function drawMaskOnCtx(targetCtx, w, h) {
-  if (isModnetSelected()) {
-    drawMirroredOnCtx(() => targetCtx.drawImage(maskCanvas, 0, 0, w, h), targetCtx, w);
-    return;
-  }
-  drawMirroredOnCtx(() => drawCoverImageOnCtx(maskCanvas, targetCtx, w, h), targetCtx, w);
+  const sourceMaskCanvas = activeMaskCanvas || maskCanvas;
+  if (!sourceMaskCanvas) return;
+  drawMirroredOnCtx(() => drawCoverImageOnCtx(sourceMaskCanvas, targetCtx, w, h), targetCtx, w);
 }
 
-// メインキャンバスの背景画を巻き添えにせず、人物だけを独立して切り抜いて生成する
 function drawPersonCutout() {
   const w = canvas.width;
   const h = canvas.height;
-  const pCanvas = getPersonCanvas(w, h);
+  getPersonCanvas(w, h);
 
-  // オフスクリーンを真っさらにクリア
   personCtx.clearRect(0, 0, w, h);
-
-  // 1. 人物単体カメラ映像を描画
   personCtx.save();
   drawMirroredOnCtx(() => drawCoverImageOnCtx(video, personCtx, w, h), personCtx, w);
-
-  // 2. マスクのアルファを用いてくり抜く（destination-in）
   personCtx.globalCompositeOperation = 'destination-in';
-  personCtx.filter = getMaskFeatherPx() > 0 ? `blur(${getMaskFeatherPx()}px)` : 'none';
+  personCtx.filter = 'none';
   drawMaskOnCtx(personCtx, w, h);
   personCtx.restore();
 }
 
 function drawSegmented() {
-  const mode = modeSelect.value;
-  if (mode === 'raw' || !maskCanvas) {
+  if (modeSelect.value === 'raw' || !activeMaskCanvas) {
     drawRaw();
     return;
   }
 
-  // 1. メインキャンバスをクリア
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-  // 2. 背景（カラー または 画像）を描画
-  drawBackground(mode);
-
-  // 3. オフスクリーンキャンバスで人物を切り抜く
+  drawBackground(modeSelect.value);
   drawPersonCutout();
-
-  // 4. 背景の上に人物画像を合成
   ctx.drawImage(personCanvas, 0, 0);
 }
 
-function requestMediaPipeSegmentationIfNeeded(now) {
-  if (!selfieSegmentation || segmentBusy) return;
-  if (now - lastSegmentAt < getSegmentationIntervalMs()) return;
+function requestSegmentationIfNeeded(now) {
+  if (!segmenter || segmentBusy) return;
+  if (now - lastSegmentAt < SEGMENT_INTERVAL_MS) return;
   lastSegmentAt = now;
   segmentBusy = true;
+
   try {
-    // segmentForVideoは同期的に動作し、コールバック関数は即座に実行完了します
-    selfieSegmentation.segmentForVideo(video, frameTimestamp, (result) => {
-      if (result && result.confidenceMasks && result.confidenceMasks.length > 0) {
-        getMaskCanvas(result.confidenceMasks[0]);
+    segmenter.segmentForVideo(video, frameTimestamp, (result) => {
+      if (result?.confidenceMasks?.length) {
+        const mask = result.confidenceMasks[0];
+        updateMaskCanvasFromArray(mask.getAsFloat32Array(), mask.width, mask.height, true);
       }
     });
     frameTimestamp += 33;
   } catch (error) {
     log('Segmentation failed. Falling back to raw preview.', error);
     setStatus('背景分離に失敗しました。カメラ映像のみ表示しています。');
-    selfieSegmentation = null;
+    closeSegmenter();
   } finally {
     segmentBusy = false;
   }
-}
-
-function requestModnetSegmentationIfNeeded(now) {
-  if (!modnetSession || segmentBusy) return;
-  if (now - lastSegmentAt < getSegmentationIntervalMs()) return;
-  lastSegmentAt = now;
-  segmentBusy = true;
-
-  try {
-    const inputTensor = createModnetInputTensor();
-    const feeds = { [modnetSession.inputNames[0]]: inputTensor };
-
-    modnetSession.run(feeds).then((results) => {
-      const outputName = modnetSession.outputNames[0];
-      const outputTensor = results[outputName];
-      updateMaskCanvasFromArray(outputTensor.data, MODNET_INPUT_SIZE, MODNET_INPUT_SIZE, true);
-    }).catch((error) => {
-      log('MODNet inference failed. Falling back to raw preview.', error);
-      setStatus('MODNet推論に失敗しました。カメラ映像のみ表示しています。');
-      modnetSession = null;
-    }).finally(() => {
-      segmentBusy = false;
-    });
-  } catch (error) {
-    log('MODNet preprocessing failed. Falling back to raw preview.', error);
-    setStatus('MODNet前処理に失敗しました。カメラ映像のみ表示しています。');
-    modnetSession = null;
-    segmentBusy = false;
-  }
-}
-
-function requestSegmentationIfNeeded(now) {
-  if (isModnetSelected()) {
-    requestModnetSegmentationIfNeeded(now);
-    return;
-  }
-  requestMediaPipeSegmentationIfNeeded(now);
 }
 
 function renderLoop(now = performance.now()) {
@@ -681,8 +742,8 @@ async function start() {
     renderLoop();
 
     try {
-      await initSelectedSegmentationModel();
-      setStatus('背景切り替え有効。モードを変更してください。');
+      await initSegmenter();
+      setStatus(`背景切り替え有効。推論デバイス: ${getSelectedComputeDeviceLabel()}`);
     } catch (error) {
       log('Segmentation initialization failed', error);
       setStatus(`${getSelectedModelLabel()} の初期化に失敗しました。カメラ映像のみ表示します。\n${error.message}`);
@@ -703,111 +764,147 @@ function stop() {
   }
   stream = null;
   video.srcObject = null;
-  closeSegmentationEngines();
+  closeSegmenter();
   frameTimestamp = 0;
   clearMaskState();
   personCanvas = null;
   personCtx = null;
-  modnetInputCanvas = null;
-  modnetInputCtx = null;
   segmentBusy = false;
   lastSegmentAt = 0;
+  revokeCurrentBackgroundUrl();
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   startButton.disabled = false;
   stopButton.disabled = true;
   setStatus('停止しました');
 }
 
-// UI Elements for dynamic display
-const colorPickerContainer = document.querySelector('#colorPickerContainer');
-const imageInputContainer = document.querySelector('#imageInputContainer');
-
 function updateVisibility() {
-  const mode = modeSelect.value;
-  colorPickerContainer.style.display = mode === 'color' ? 'grid' : 'none';
-  imageInputContainer.style.display = mode === 'image' ? 'flex' : 'none';
+  colorPickerContainer.style.display = modeSelect.value === 'color' ? 'grid' : 'none';
+  imageInputContainer.style.display = modeSelect.value === 'image' ? 'flex' : 'none';
 }
 
-function updateModelControlState() {
-  const usingModnet = isModnetSelected();
-  maskStyleSelect.disabled = usingModnet;
-  maskAlphaLowInput.disabled = usingModnet;
-  maskAlphaHighInput.disabled = usingModnet;
-  maskStyleSelect.title = usingModnet ? 'MODNet はアルファマットを直接出力するため、この設定は使いません。' : '';
-  maskAlphaLowInput.title = usingModnet ? 'MODNet はアルファマットを直接出力するため、この設定は使いません。' : '';
-  maskAlphaHighInput.title = usingModnet ? 'MODNet はアルファマットを直接出力するため、この設定は使いません。' : '';
+function resetTemporalAndRefreshMask() {
+  resetTemporalSmoothing();
+  refreshMaskCanvas();
 }
 
-modeSelect.addEventListener('change', updateVisibility);
+function applyComparisonBaseline() {
+  modeSelect.value = 'raw';
+  maskStyleSelect.value = 'hard';
+  maskAlphaLowInput.value = '0.35';
+  maskAlphaHighInput.value = '0.75';
+  maskMorphInput.value = '0';
+  maskFeatherInput.value = '0';
+  temporalSmoothingInput.value = '0';
+  syncMaskSettingsFromUI();
 
-// Run once initially to hide non-active controls
+  updateVisibility();
+  updateMaskAlphaValues();
+  updateMaskMorphValue();
+  updateMaskFeatherValue();
+  updateTemporalSmoothingValue();
+
+  backgroundImage = null;
+  backgroundCacheKey = '';
+  revokeCurrentBackgroundUrl();
+
+  clearMaskState();
+  log('Comparison baseline applied');
+  setStatus('比較用設定に戻しました');
+}
+
 updateVisibility();
-updateModelControlState();
+syncMaskSettingsFromUI();
 updateMaskAlphaValues();
 updateMaskMorphValue();
 updateMaskFeatherValue();
 updateTemporalSmoothingValue();
-loadBackgroundImage(defaultBackgroundUrl, DEFAULT_BACKGROUND_NAME);
+
+modeSelect.addEventListener('change', updateVisibility);
 
 imageInput.addEventListener('change', () => {
   const file = imageInput.files?.[0];
   if (!file) return;
 
-  // 古いURLがあれば解放してメモリリークを防ぐ
-  if (currentBgUrl) {
-    URL.revokeObjectURL(currentBgUrl);
-  }
-
-  // 新しいオブジェクトURLを生成（onload完了まで解放しない）
+  revokeCurrentBackgroundUrl();
   currentBgUrl = URL.createObjectURL(file);
   loadBackgroundImage(currentBgUrl, file.name);
 });
 
+loadDefaultImageButton.addEventListener('click', () => {
+  loadBackgroundImage(defaultBackgroundUrl, DEFAULT_BACKGROUND_NAME);
+});
+
+resetComparisonButton.addEventListener('click', () => {
+  applyComparisonBaseline();
+});
+
 modelSelect.addEventListener('change', async () => {
-  updateModelControlState();
   if (!running) return;
   setStatus('モデル設定を変更しました。再初期化しています...');
   try {
-    await initSelectedSegmentationModel();
-    setStatus('背景切り替え有効。');
+    clearMaskState();
+    await initSegmenter();
+    setStatus(`背景切り替え有効。推論デバイス: ${getSelectedComputeDeviceLabel()}`);
   } catch (error) {
     log('Model reinitialization failed', error);
     setStatus('モデル再初期化に失敗しました。カメラ映像のみ表示します。');
   }
 });
 
+computeDeviceSelect.addEventListener('change', async () => {
+  log('Compute device changed', { device: getSelectedComputeDeviceLabel() });
+  if (!running) return;
+  setStatus('推論デバイスを変更しました。再初期化しています...');
+  try {
+    clearMaskState();
+    await initSegmenter();
+    setStatus(`背景切り替え有効。推論デバイス: ${getSelectedComputeDeviceLabel()}`);
+  } catch (error) {
+    log('Compute device reinitialization failed', error);
+    setStatus('推論デバイスの再初期化に失敗しました。カメラ映像のみ表示します。');
+  }
+});
+
 maskStyleSelect.addEventListener('change', () => {
-  resetTemporalSmoothing();
+  syncMaskSettingsFromUI();
   log('Mask style changed', { style: maskStyleSelect.value });
+  resetTemporalAndRefreshMask();
 });
 
 maskAlphaLowInput.addEventListener('input', () => {
+  syncMaskSettingsFromUI();
   updateMaskAlphaValues();
-  resetTemporalSmoothing();
   log('Mask alpha low changed', { value: getMaskAlphaLow() });
+  resetTemporalAndRefreshMask();
 });
 
 maskAlphaHighInput.addEventListener('input', () => {
+  syncMaskSettingsFromUI();
   updateMaskAlphaValues();
-  resetTemporalSmoothing();
   log('Mask alpha high changed', { value: getMaskAlphaHigh() });
+  resetTemporalAndRefreshMask();
 });
 
 maskMorphInput.addEventListener('input', () => {
+  syncMaskSettingsFromUI();
   updateMaskMorphValue();
-  resetTemporalSmoothing();
   log('Mask morphology changed', { amount: getMaskMorphAmount() });
+  resetTemporalAndRefreshMask();
 });
 
 maskFeatherInput.addEventListener('input', () => {
+  syncMaskSettingsFromUI();
   updateMaskFeatherValue();
   log('Mask feather changed', { px: getMaskFeatherPx() });
+  rerenderMaskCanvas();
 });
 
 temporalSmoothingInput.addEventListener('input', () => {
+  syncMaskSettingsFromUI();
   updateTemporalSmoothingValue();
-  resetTemporalSmoothing();
   log('Temporal smoothing changed', { ratio: getTemporalSmoothing() });
+  resetTemporalAndRefreshMask();
 });
 
 startButton.addEventListener('click', start);

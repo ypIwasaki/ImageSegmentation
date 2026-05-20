@@ -9,7 +9,7 @@
     <div id="app">
       <header>
         <h1>⚡ Realtime Background Switcher</h1>
-        <p>MediaPipe / MODNet + 2D Canvas compositing pipeline</p>
+        <p>MediaPipe Selfie Segmentation + 2D Canvas compositing pipeline</p>
       </header>
 
       <main class="layout">
@@ -19,7 +19,6 @@
         </section>
 
         <aside class="panel">
-          <!-- 1. カメラ制御 -->
           <div class="panel-section">
             <span class="section-title">カメラ接続</span>
             <div class="control-row">
@@ -32,7 +31,7 @@
                 停止
               </button>
             </div>
-            
+
             <label class="checkbox-label">
               <span>左右反転（ミラー）</span>
               <div class="checkbox-container">
@@ -44,17 +43,24 @@
             <label style="margin-top: 4px;">
               AIモデル選択
               <select id="modelSelect">
-                <option value="modnet">MODNet (matting / 高品質)</option>
-                <option value="mediapipe-general" selected>MediaPipe General (高精度)</option>
-                <option value="mediapipe-landscape">MediaPipe Landscape (軽量 / 高速)</option>
+                <option value="1" selected>General (高精度)</option>
+                <option value="0">Landscape (軽量 / 高速)</option>
+              </select>
+            </label>
+
+            <label>
+              推論デバイス
+              <select id="computeDeviceSelect">
+                <option value="gpu" selected>GPU</option>
+                <option value="cpu">CPU</option>
               </select>
             </label>
 
             <label>
               切り抜きマスク
               <select id="maskStyleSelect">
-                <option value="soft" selected>Soft (改善版 / 滑らか)</option>
-                <option value="hard">Hard (従来 / 2値化)</option>
+                <option value="soft">Soft (改善版 / 滑らか)</option>
+                <option value="hard" selected>Hard (従来 / 2値化)</option>
               </select>
             </label>
 
@@ -106,7 +112,7 @@
             <div class="slider-container">
               <div class="slider-header">
                 <label for="maskFeatherInput">境界フェザー</label>
-                <span class="slider-value" id="maskFeatherValue">1.5px</span>
+                <span class="slider-value" id="maskFeatherValue">0.0px</span>
               </div>
               <input
                 id="maskFeatherInput"
@@ -114,14 +120,14 @@
                 min="0"
                 max="3"
                 step="0.5"
-                value="1.5"
+                value="0"
               />
             </div>
 
             <div class="slider-container">
               <div class="slider-header">
                 <label for="temporalSmoothingInput">フレーム平滑化</label>
-                <span class="slider-value" id="temporalSmoothingValue">35%</span>
+                <span class="slider-value" id="temporalSmoothingValue">0%</span>
               </div>
               <input
                 id="temporalSmoothingInput"
@@ -129,20 +135,19 @@
                 min="0"
                 max="0.9"
                 step="0.05"
-                value="0.35"
+                value="0"
               />
             </div>
           </div>
 
-          <!-- 2. 背景合成モード -->
           <div class="panel-section">
             <span class="section-title">背景エフェクト設定</span>
             <label>
               表示モード
               <select id="modeSelect">
-                <option value="raw">カメラ映像そのまま</option>
+                <option value="raw" selected>カメラ映像そのまま</option>
                 <option value="color">背景単色</option>
-                <option value="image" selected>背景画像差し替え</option>
+                <option value="image">背景画像差し替え</option>
               </select>
             </label>
 
@@ -155,13 +160,21 @@
               背景画像アップロード
               <input id="imageInput" type="file" accept="image/*" />
             </label>
+
+            <div class="control-row">
+              <button id="loadDefaultImageButton" type="button" class="secondary-button">
+                サンプル背景
+              </button>
+              <button id="resetComparisonButton" type="button" class="secondary-button">
+                比較用リセット
+              </button>
+            </div>
           </div>
 
-          <!-- 4. システム状態 -->
           <div class="panel-section status-container">
             <span class="section-title">システム状態</span>
             <div class="status" id="status">待機中</div>
-            
+
             <details>
               <summary>診断ログ (デバッグ)</summary>
               <pre id="debugLog"></pre>
@@ -170,7 +183,6 @@
         </aside>
       </main>
     </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.21.1/ort.webgpu.min.js"></script>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
